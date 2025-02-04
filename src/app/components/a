@@ -1,0 +1,307 @@
+"use client";
+import React, { useState, useEffect } from 'react';
+import { AuthClient } from '@dfinity/auth-client';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Lock, Unlock, Key, Trash2, AlertCircle, LogOut, UserPlus, Shield } from 'lucide-react';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Principal } from '@dfinity/principal';
+
+const EncryptedNotes = () => {
+  // 既存のstate
+  const [authClient, setAuthClient] = useState(null);
+  const [identity, setIdentity] = useState(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAuthClientReady, setIsAuthClientReady] = useState(false);
+  const [note, setNote] = useState('');
+  const [encryptionKey, setEncryptionKey] = useState('');
+  const [encryptedNotes, setEncryptedNotes] = useState([]);
+  const [decryptedNote, setDecryptedNote] = useState('');
+  const [error, setError] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  // 新しく追加するstate
+  const [backupGuardians, setBackupGuardians] = useState([]);
+  const [newGuardianId, setNewGuardianId] = useState('');
+  const [isRecoveryMode, setIsRecoveryMode] = useState(false);
+  const [recoveryApprovals, setRecoveryApprovals] = useState([]);
+  const [backupEncryptionKey, setBackupEncryptionKey] = useState('');
+
+  // 初期化処理 (既存のコードは維持)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        const client = await AuthClient.create();
+        setAuthClient(client);
+
+        if (await client.isAuthenticated()) {
+          const identity = client.getIdentity();
+          handleAuthSuccess(identity);
+        }
+      } catch (e) {
+        console.error('AuthClient initialization failed:', e);
+        setError('認証クライアントの初期化に失敗しました');
+      }
+    };
+
+    initAuth();
+  }, []);
+
+  // バックアップガーディアンの読み込み
+  useEffect(() => {
+    if (isAuthenticated && identity) {
+      const principal = identity.getPrincipal().toString();
+      const savedGuardians = localStorage.getItem(`backup-guardians-${principal}`);
+      if (savedGuardians) {
+        setBackupGuardians(JSON.parse(savedGuardians));
+      }
+
+      // バックアップ暗号化キーの読み込み
+      const savedBackupKey = localStorage.getItem(`backup-key-${principal}`);
+      if (savedBackupKey) {
+        setBackupEncryptionKey(savedBackupKey);
+      }
+    }
+  }, [isAuthenticated, identity]);
+
+  // バックアップガーディアンの保存
+  useEffect(() => {
+    if (isAuthenticated && identity) {
+      const principal = identity.getPrincipal().toString();
+      localStorage.setItem(`backup-guardians-${principal}`, JSON.stringify(backupGuardians));
+    }
+  }, [backupGuardians, isAuthenticated, identity]);
+
+  // バックアップガーディアンの追加
+  const handleAddGuardian = async () => {
+    try {
+      // Principal IDの検証
+      const guardianPrincipal = Principal.fromText(newGuardianId);
+      
+      // 重複チェック
+      if (backupGuardians.some(g => g.principalId === newGuardianId)) {
+        setError('このガーディアンは既に登録されています');
+        return;
+      }
+
+      // 新しいガーディアンを追加
+      const newGuardian = {
+        principalId: newGuardianId,
+        dateAdded: new Date().toISOString(),
+        status: 'active'
+      };
+
+      setBackupGuardians(prev => [...prev, newGuardian]);
+      setNewGuardianId('');
+
+      // バックアップキーの生成・更新（ガーディアン追加時に更新）
+      const newBackupKey = await generateBackupKey();
+      setBackupEncryptionKey(newBackupKey);
+      
+      // バックアップキーの保存
+      if (identity) {
+        const principal = identity.getPrincipal().toString();
+        localStorage.setItem(`backup-key-${principal}`, newBackupKey);
+      }
+
+    } catch (e) {
+      setError('無効なPrincipal IDです');
+    }
+  };
+
+  // バックアップキーの生成と分散
+  const generateBackupKey = async () => {
+    // メインの暗号化キーをバックアップ
+    const keyToBackup = encryptionKey;
+    
+    // ガーディアンごとに個別の暗号化キーを生成
+    const guardianKeys = await Promise.all(backupGuardians.map(async guardian => {
+      const guardianKeyMaterial = new Uint8Array(32);
+      crypto.getRandomValues(guardianKeyMaterial);
+      const guardianKey = await crypto.subtle.importKey(
+        'raw',
+        guardianKeyMaterial,
+        { name: 'AES-GCM', length: 256 },
+        true,
+        ['encrypt']
+      );
+      
+      // ガーディアンごとにバックアップキーを暗号化
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const encryptedKey = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        guardianKey,
+        new TextEncoder().encode(keyToBackup)
+      );
+      
+      return {
+        principalId: guardian.principalId,
+        encryptedKey: Array.from(new Uint8Array(encryptedKey)),
+        iv: Array.from(iv),
+        guardianPublicKey: Array.from(guardianKeyMaterial)
+      };
+    }));
+    
+    return JSON.stringify(guardianKeys);
+  };
+
+  // リカバリーモードの開始
+  const startRecoveryMode = () => {
+    setIsRecoveryMode(true);
+    setRecoveryApprovals([]);
+  };
+
+  // ガーディアンによる承認
+  const handleGuardianApproval = async () => {
+    if (!authClient.isAuthenticated()) {
+      setError('承認にはログインが必要です');
+      return;
+    }
+
+    const guardianIdentity = authClient.getIdentity();
+    const guardianPrincipal = guardianIdentity.getPrincipal().toString();
+
+    // ガーディアンとして登録されているか確認
+    const isRegisteredGuardian = backupGuardians.some(
+      g => g.principalId === guardianPrincipal
+    );
+
+    if (!isRegisteredGuardian) {
+      setError('あなたはガーディアンとして登録されていません');
+      return;
+    }
+
+    // 承認の重複チェック
+    if (recoveryApprovals.includes(guardianPrincipal)) {
+      setError('既に承認済みです');
+      return;
+    }
+
+    // 承認を追加
+    setRecoveryApprovals(prev => [...prev, guardianPrincipal]);
+
+    // 必要な承認数が集まったかチェック（例：過半数）
+    const requiredApprovals = Math.ceil(backupGuardians.length / 2);
+    if (recoveryApprovals.length + 1 >= requiredApprovals) {
+      // リカバリー処理の実行
+      await executeRecovery();
+    }
+  };
+
+  // リカバリーの実行
+  const executeRecovery = async () => {
+    try {
+      setIsProcessing(true);
+
+      // バックアップキーを使用して暗号化キーを復元
+      setEncryptionKey(backupEncryptionKey);
+
+      // リカバリーモードを終了
+      setIsRecoveryMode(false);
+      setRecoveryApprovals([]);
+
+      setError('');
+    } catch (e) {
+      setError('リカバリーに失敗しました');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // 既存の暗号化/復号化関連の関数は維持...
+
+  // UI - バックアップガーディアン管理セクション
+  const renderBackupManagement = () => (
+    <div className="space-y-4 mt-6">
+      <h3 className="text-lg font-medium">バックアップガーディアン管理</h3>
+      
+      <div className="flex gap-2">
+        <Input
+          value={newGuardianId}
+          onChange={(e) => setNewGuardianId(e.target.value)}
+          placeholder="ガーディアンのPrincipal ID"
+          className="flex-grow"
+        />
+        <Button 
+          onClick={handleAddGuardian}
+          disabled={!newGuardianId.trim()}
+          className="gap-2"
+        >
+          <UserPlus className="w-4 h-4" />
+          追加
+        </Button>
+      </div>
+
+      {backupGuardians.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-sm text-gray-500">
+            登録済みガーディアン ({backupGuardians.length}名)
+          </p>
+          {backupGuardians.map((guardian) => (
+            <div key={guardian.principalId} 
+                 className="flex items-center justify-between p-2 bg-gray-50 rounded">
+              <code className="text-xs">{guardian.principalId}</code>
+              <span className="text-xs text-gray-500">
+                {new Date(guardian.dateAdded).toLocaleDateString()}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  // UI - リカバリーモードセクション
+  const renderRecoveryMode = () => (
+    <div className="space-y-4">
+      <Alert>
+        <Shield className="w-4 h-4" />
+        <AlertDescription>
+          リカバリーモード: {recoveryApprovals.length} / {Math.ceil(backupGuardians.length / 2)} の承認
+        </AlertDescription>
+      </Alert>
+
+      <Button
+        onClick={handleGuardianApproval}
+        disabled={isProcessing}
+        className="w-full gap-2"
+      >
+        <Key className="w-4 h-4" />
+        ガーディアンとして承認
+      </Button>
+    </div>
+  );
+
+  // メインのレンダリング（既存のコードを拡張）
+  return (
+    <Card className="w-full max-w-2xl mx-auto mt-8">
+      <CardHeader>
+        <CardTitle>暗号化メモ</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {error && (
+          <Alert variant="destructive">
+            <AlertCircle className="w-4 h-4" />
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {isRecoveryMode ? (
+          renderRecoveryMode()
+        ) : (
+          <>
+            {/* 既存のメモ機能 */}
+            {/* ... */}
+            
+            {/* バックアップ管理セクション */}
+            {renderBackupManagement()}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+};
+
+export default EncryptedNotes;
